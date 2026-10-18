@@ -1,0 +1,82 @@
+name: review
+
+# A Claude review of every pull request, posted as a comment while its other
+# checks run, so its findings are fixed in the same pull request before it
+# merges rather than in a cleanup afterwards.
+#
+# It runs on Reda's Claude subscription through `CLAUDE_CODE_OAUTH_TOKEN`
+# (made with `claude setup-token`), not a paid API key. Without that secret
+# the job says so and passes. It reads and comments; it never pushes. A pull
+# request opened by a bot (Dependabot and the like) is not reviewed.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false && github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    steps:
+      - name: No token, no review
+        if: env.HAS_TOKEN != 'true'
+        run: echo "CLAUDE_CODE_OAUTH_TOKEN is not set in this repository's secrets, so nothing is reviewed."
+
+      - uses: actions/checkout@v4
+        if: env.HAS_TOKEN == 'true'
+        with:
+          fetch-depth: 1
+
+      - name: Review
+        if: env.HAS_TOKEN == 'true'
+        # v1.0.230, pinned by commit
+        uses: anthropics/claude-code-action@3bc13d79e059f7a7c3023515ac6fe827db6403bf
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: >-
+            --model opus
+            --max-turns 60
+            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(git log:*),Bash(git show:*),Bash(git grep:*)"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You review this pull request before it merges. It was most likely
+            written by a Claude session that will act on your findings; Reda, the
+            owner, is new to code. Read CLAUDE.md first if the repository has one,
+            and any .claude/rules/ file whose `paths` cover a changed file. See the
+            change with `gh pr diff`. Never read a file over 3 000 lines whole:
+            search it and read around what you find.
+
+            Look for, in this order:
+            1. Defects: wrong behaviour, a case the change misses, a failure on an
+               odd input (empty, missing, repeated, zero), a secret written into
+               the code or a log.
+            2. Its twins: where else in the repository the same cause fires and this
+               pull request leaves it (search for it; say how many places).
+            3. Sentences made untrue: search CLAUDE.md, README and the docs for what
+               the change touches, and list each sentence that is now false or
+               stale. Those files state what is, not what was: flag any sentence
+               the pull request adds there that only records history.
+            4. A rule in CLAUDE.md the change breaks.
+
+            Not wanted: style, naming, praise, a summary of the pull request, or a
+            suggestion that fixes no defect.
+
+            Post exactly one comment with `gh pr comment`: numbered findings, most
+            severe first, each with file:line, what is wrong, a concrete failure
+            (this input, this wrong result) and the fix. If nothing survives, the
+            comment says "No findings." and names the two or three things you
+            checked. Under 400 words.
