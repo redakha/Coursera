@@ -1,13 +1,14 @@
 name: review
 
-# A Claude review of every pull request, posted as a comment while its other
+# A Claude review of every pull request but a dependency bot's, posted as a comment while its other
 # checks run, so its findings are fixed in the same pull request before it
 # merges rather than in a cleanup afterwards.
 #
 # It runs on Reda's Claude subscription through `CLAUDE_CODE_OAUTH_TOKEN`
 # (made with `claude setup-token`), not a paid API key. Without that secret
 # the job says so and passes. It reads and comments; it never pushes. A pull
-# request opened by a bot (Dependabot and the like) is not reviewed.
+# request Dependabot or Renovate opens is not reviewed, and passes; any
+# other bot's is, since a Claude session may open one through an app.
 
 on:
   pull_request:
@@ -23,7 +24,10 @@ permissions:
 
 jobs:
   review:
-    if: github.event.pull_request.draft == false && github.event.pull_request.user.type != 'Bot'
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.user.login != 'renovate[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
