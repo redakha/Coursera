@@ -9,6 +9,28 @@ name: review
 # the job says so and passes. It reads and comments; it never pushes. A pull
 # request Dependabot or Renovate opens is not reviewed, and passes; any
 # other bot's is, since a Claude session may open one through an app.
+#
+# Three depths, chosen by the step "Choose the review" from what the pull
+# request changes and why the job started (Reda, 21 Oct 2026, after reading
+# how Anthropic's own Code Review works: find, verify, rank):
+# - `full`: a pull request that changes code, when it opens, is reopened or
+#   is marked ready. Opus at high effort, 60 turns at most, and every
+#   finding handed to a subagent that tries to disprove it before it is
+#   posted.
+# - `followup`: a push to such a pull request. Only the commits pushed
+#   (`github.event.before`..`after`) are read, with the last review's
+#   findings, to say which are fixed and whether the push broke anything.
+#   Sonnet at high effort, 30 turns. A push GitHub cannot compare gets `full`.
+# - `light`: a pull request that changes only Markdown, docs/, notes/ or
+#   .claude/, at any event. Sonnet at medium effort, 20 turns, and only
+#   checklist items 3 and 4. No subagent.
+# Every run still posts its one comment and ends green.
+#
+# The rules the reviewer judges by (CLAUDE.md and .claude/rules/) are read
+# from the base branch into .review_base/, so a pull request cannot rewrite
+# the rules it is judged by; its own changes to them are reviewed as part
+# of the diff. This file itself runs as the pull request has it (a
+# `pull_request` job always does).
 
 on:
   pull_request:
@@ -42,6 +64,56 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Choose the review
+        id: pick
+        if: env.HAS_TOKEN == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          mkdir -p .review_base
+
+          # The rules as the base branch has them.
+          git fetch --quiet --depth 1 origin "$BASE"
+          for path in CLAUDE.md .claude; do
+            if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
+              git archive FETCH_HEAD "$path" | tar -x -C .review_base
+            fi
+          done
+
+          # Markdown, docs/, notes/ and .claude/ alone is a docs or rules change.
+          gh pr diff "$PR" --repo "$REPO" --name-only > .review_base/files.txt
+          if grep -qvE '(\.md$|^docs/|^notes/|^\.claude/)' .review_base/files.txt; then
+            docs_only=no
+          else
+            docs_only=yes
+          fi
+
+          tier=full
+          if [ "$docs_only" = yes ]; then
+            tier=light
+          elif [ "$ACTION" = synchronize ] && [ -n "$BEFORE" ] && \
+               gh api -H "Accept: application/vnd.github.diff" \
+                 "repos/$REPO/compare/$BEFORE...$AFTER" > .review_base/pushed.diff 2>/dev/null; then
+            tier=followup
+          fi
+
+          case "$tier" in
+            full)     args="--model opus --effort high --max-turns 60" ;;
+            followup) args="--model sonnet --effort high --max-turns 30" ;;
+            light)    args="--model sonnet --effort medium --max-turns 20" ;;
+          esac
+          echo "tier=$tier" >> "$GITHUB_OUTPUT"
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+          echo "review: $tier ($args); $(wc -l < .review_base/files.txt) files changed"
+
       - name: Review
         if: env.HAS_TOKEN == 'true'
         # v1.0.230, pinned by commit
@@ -50,21 +122,35 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: >-
-            --model opus
-            --max-turns 60
-            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(git log:*),Bash(git show:*),Bash(git grep:*)"
+            ${{ steps.pick.outputs.args }}
+            --allowedTools "Read,Grep,Glob,Agent,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(git log:*),Bash(git show:*),Bash(git grep:*)"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
+            DEPTH: ${{ steps.pick.outputs.tier }}
 
             You review this pull request before it merges. It was most likely
             written by a Claude session that will act on your findings; Reda, the
-            owner, is new to code. Read CLAUDE.md first if the repository has one,
-            and any .claude/rules/ file whose `paths` cover a changed file. See the
-            change with `gh pr diff`. Never read a file over 3 000 lines whole:
-            search it and read around what you find.
+            owner, is new to code.
 
-            Look for, in this order:
+            The rules you judge by are the base branch's: read
+            .review_base/CLAUDE.md if it exists, and any .review_base/.claude/rules/
+            file whose `paths` cover a changed file, not the copies in the checkout.
+            If the pull request changes those rules, that change is part of what you
+            review. .review_base/files.txt lists the files changed. Never read a
+            file over 3 000 lines whole: search it and read around what you find.
+
+            What to read, by DEPTH:
+            - full: the whole change, with `gh pr diff`.
+            - followup: .review_base/pushed.diff, the commits pushed since the last
+              review, and the last review comment on this pull request
+              (`gh pr view --comments`). Say which of its findings this push fixes
+              and which still stand, then look for what the push itself breaks.
+              Open other files only to check a finding.
+            - light: the whole change, with `gh pr diff`; it changes only Markdown,
+              docs/, notes/ or .claude/. Do checklist items 3 and 4 only.
+
+            The checklist, in this order:
             1. Defects: wrong behaviour, a case the change misses, a failure on an
                odd input (empty, missing, repeated, zero), a secret written into
                the code or a log.
@@ -76,11 +162,23 @@ jobs:
                the pull request adds there that only records history.
             4. A rule in CLAUDE.md the change breaks.
 
+            Verify before you post. At DEPTH full, give each finding you mean to
+            post to its own subagent (the Agent tool), with the finding, its
+            file:line and the failure you claim, and ask it to disprove the finding
+            from the code alone: read the lines, the callers and the guards, and
+            answer CONFIRMED with the input that fails, or REFUTED with the line that
+            prevents it. Post only the confirmed ones. At DEPTH followup or light,
+            re-open each finding's lines yourself and drop any you cannot tie to a
+            concrete failure.
+
             Not wanted: style, naming, praise, a summary of the pull request, or a
             suggestion that fixes no defect.
 
-            Post exactly one comment with `gh pr comment`: numbered findings, most
-            severe first, each with file:line, what is wrong, a concrete failure
+            Post exactly one comment with `gh pr comment`. Open it with one line
+            naming the depth (for example "Review (full, 3 findings verified, 1
+            dropped)"). Then numbered findings, most severe first, each marked
+            **blocking** (it breaks behaviour, data or a rule) or **minor**, each
+            with file:line, what is wrong, a concrete failure
             (this input, this wrong result) and the fix. If nothing survives, the
             comment says "No findings." and names the two or three things you
             checked. Under 400 words.
